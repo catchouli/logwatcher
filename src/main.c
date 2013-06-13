@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 600
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,10 +44,13 @@ int execute_sql(const char* sql);
 // Get count of rows in table
 int count_sql(const char* table);
 
+// Globals
 sqlite3* db;                  // Sqlite database
 char* sqlite_error = NULL;    // Sqlite error
 
 int sqlite_messages = 0;      // Messages in message table
+
+time_t current_day = 0;       // Current day (last encountered in log)
 
 // Entry point
 int main(int argc, char** argv)
@@ -195,22 +200,50 @@ void parse_lines(char* lines)
 
 void parse_line(const char* line)
 {
-	int hour;              // Hour
-	int minute;            // Minute
+	int year;
+	char month[32];
+	int date;
+	int hour;
+	int minute;
+
 	char nick[8192];       // Nickname
 	char message[8192];    // Message text
 
 	int rc;                // Return code
+	int rc2;               // Return code
 
 	hour = 0;
 	minute = 0;
 	strcpy(nick, "nick");
 	strcpy(message, "message");
 
+	// Parse log open and day change message
+	rc = sscanf(line, "--- Log opened %*s %s %d %*d:%*d:%*d %d", month, &date, &year);
+	rc2 = sscanf(line, "--- Day changed %*s %s %d %d", month, &date, &year);
+	if (rc == 3 || rc2 == 3)
+	{
+		char buffer[1024];
+		struct tm time_struct;
+
+		// Create date string
+		sprintf(buffer, "%d %s %d", date, month, year);
+
+		// Parse date string
+		if (strptime(buffer, "%d %b %Y", &time_struct) == NULL)
+		{
+			fprintf(stderr, "Failed to parse date format %s\n", buffer);
+
+			return;
+		}
+
+		// Convert day to unix time
+		current_day = mktime(&time_struct);
+
+		return;
+	}
+
 	// Parse message string
 	rc = sscanf(line, "%d:%d <%[^>]> %[^\n]", &hour, &minute, nick, message);
-
-	// If this is a message string
 	if (rc == 4)
 	{
 		sqlite3_stmt* statement;
@@ -228,6 +261,7 @@ void parse_line(const char* line)
 		// Bind values
 		sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
 		sqlite3_bind_text(statement, 2, message, -1, SQLITE_STATIC);
+		sqlite3_bind_int(statement, 3, current_day);
 
 		// Run statement
 		rc = sqlite3_step(statement);
@@ -247,7 +281,8 @@ void parse_line(const char* line)
 		}
 
 		// Bind values
-		sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
+		sqlite3_bind_int(statement, 1, current_day);
+		sqlite3_bind_text(statement, 2, nick, -1, SQLITE_STATIC);
 
 		// Run statement
 		rc = sqlite3_step(statement);
@@ -271,6 +306,7 @@ void parse_line(const char* line)
 
 			// Bind values
 			sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
+			sqlite3_bind_int(statement, 2, current_day);
 
 			// Run statement
 			rc = sqlite3_step(statement);
@@ -285,6 +321,8 @@ void parse_line(const char* line)
 
 		// Increment total message count
 		sqlite_messages++;
+
+		return;
 	}
 }
 
@@ -294,7 +332,7 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
                           const char *upload_data,
                           size_t *upload_data_size, void **con_cls)
 {
-	int i;                                 // Counter
+	int i, j;                                 // Counters
 	char buffer[8192];                     // String buffer
 
 	int rc;                                // Return code
@@ -310,7 +348,8 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	double time_taken;                     // Time taken for execution
 
 	// Constants (which should probably be moved into a config file at some point in the future)
-	const int max_highscore_users = 10;    // Number of users to show in the message count highscores
+	const int max_highscore_users = 20;    // Number of users to show in the message count highscores
+	const int max_extended_hs = 20;        // Number of extended highscores to show
 	const int random_message_count = 10;   // Number of random messages wanted
 
 	// Initialise start time
@@ -320,11 +359,14 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	ss = ss_create();
 
 	// Write start of page
-	ss_add(&ss, "<html><head><title>Renaporn stats for #talkhaus</title></head><body>");
+	ss_add(&ss, "<html><head><link rel=\"stylesheet\" href=\"http://www.renaporn.com/~rena/stats.css\">");
+	ss_add(&ss, "<title>Renaporn stats for #talkhaus</title>");
+	ss_add(&ss, "</head><body>");
 	ss_add(&ss, "<h1>Renaporn stats for #talkhaus</h1>");
 
 	// Print out top max_highscore_users users with most messages
 	ss_add(&ss, "<h2>Users with the most messages</h2><table>");
+	ss_add(&ss, "<tr><td></td><td>Nickname</td><td>Lines</td><td>Last seen</td><td>Random quote</td></tr>");
 
 	// Create statement
 	rc = sqlite3_prepare_v2(db, SELECT_TOP_USERS, -1, &statement, NULL);
@@ -337,21 +379,78 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	sqlite3_bind_int(statement, 1, max_highscore_users);
 
 	// Iterate through results
+	i = 0;
 	rc = sqlite3_step(statement);
 	while (rc == SQLITE_ROW)
 	{
-		const unsigned char* nick;
+		int rc2;
+		int random_id;
+		char* random_message = NULL;
+
+		char time_string[1024];
+		const char* nick;
 		int messages;
+		time_t time;
+		struct tm* time_struct;
+
+		sqlite3_stmt* statement2;
 
 		// Get values
-		nick = sqlite3_column_text(statement, 0);
+		nick = (const char*)sqlite3_column_text(statement, 0);
 		messages = sqlite3_column_int(statement, 1);
+		time = sqlite3_column_int(statement, 2);
+
+		// Select random message
+		random_id = rand() % messages;
+
+		// Prepare statement
+		rc2 = sqlite3_prepare_v2(db, SELECT_USER_MESSAGE_AT_POSITION, -1, &statement2, NULL);
+		if (rc2 != SQLITE_OK)
+		{
+			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+		}
+
+		// Bind parameters
+		sqlite3_bind_text(statement2, 1, nick, -1, SQLITE_STATIC);
+		sqlite3_bind_int(statement2, 2, random_id);
+
+		// Execute query
+		rc2 = sqlite3_step(statement2);
+		if (rc2 == SQLITE_ROW)
+		{
+			// Get string
+			const char* msg = (const char*)sqlite3_column_text(statement2, 0);
+
+			// Copy string
+			random_message = malloc(strlen(msg) + 1);
+			strcpy(random_message, msg);
+
+			// Should equal SQLITE_DONE
+			rc2 = sqlite3_step(statement2);
+		}
+
+		// Check if done
+		if (rc2 != SQLITE_DONE)
+		{
+			fprintf(stderr, "Statement should be done by now but rc != SQLITE_DONE");
+		}
+
+		// Finalise statement
+		sqlite3_finalize(statement2);
+
+		// Work out time string
+		time_struct = gmtime(&time);
+		strftime(time_string, 1024, "%d %b %Y", time_struct);
 
 		// Output data
-		sprintf(buffer, "<tr><td>%s</td><td>%d</td></tr>", nick, messages);
+		sprintf(buffer, "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td><td><p>%s</p></td></tr>", i, nick, messages, time_string, random_message);
 		ss_add(&ss, buffer);
 
+		// Free memory
+		free(random_message);
+
 		// Get next row
+		i++;
 		rc = sqlite3_step(statement);
 	}
 
@@ -364,7 +463,63 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	sqlite3_finalize(statement);
 
 	// End table
-	ss_add(&ss, "</table>");
+	ss_add(&ss, "</table><br><h3>These users didn't quite make it");
+
+	// Extended highscores table
+	rc = sqlite3_prepare_v2(db, SELECT_TOP_USERS_EXT, -1, &statement, NULL);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+	}
+
+	// Bind parameters
+	sqlite3_bind_int(statement, 1, max_extended_hs);
+	sqlite3_bind_int(statement, 2, max_highscore_users);
+
+	// Execute query
+	rc = sqlite3_step(statement);
+
+	// Write out in 5 column table
+	ss_add(&ss, "<table>");
+	for (i = 0; i < (int)(max_extended_hs / 5 + 0.5); ++i)
+	{
+		ss_add(&ss, "<tr>");
+		for (j = 0; j < 5; ++j)
+		{
+			char buffer[2048];
+
+			const char* nick;
+			int messages;
+
+			// Blank string
+			buffer[0] = 0;
+
+			if (rc == SQLITE_ROW)
+			{
+				// Get nick and messages
+				nick = (const char*)sqlite3_column_text(statement, 0);
+				messages = sqlite3_column_int(statement, 1);
+
+				// Write nick (messages) to buffer
+				sprintf(buffer, "%s (%d)", nick, messages);
+
+				// Fetch next row
+				rc = sqlite3_step(statement);
+			}
+
+			// Write cell
+			ss_add(&ss, "<td>");
+			ss_add(&ss, buffer);
+			ss_add(&ss, "</td>");
+		}
+		ss_add(&ss, "</tr>");
+	}
+
+	// Finalise statement
+	sqlite3_finalize(statement);
+
+	// Line break
+	ss_add(&ss, "</table><br>");
 
 	// Print out random_message_count random rows
 	ss_add(&ss, "<h2>10 random messages from log</h2><table>");
@@ -380,6 +535,8 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 		// Iterate random_message_count times, selecting a row each time
 		for (i = 0; i < random_message_count; ++i)
 		{
+			time_t time;
+
 			// Select random id
 			random_id = rand() % sqlite_messages;
 
@@ -393,10 +550,11 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 				const unsigned char* nick;
 				const unsigned char* message;
 
-				nick = sqlite3_column_text(statement, 0);
-				message = sqlite3_column_text(statement, 1);
+				time = sqlite3_column_int(statement, 0);
+				nick = sqlite3_column_text(statement, 1);
+				message = sqlite3_column_text(statement, 2);
 
-				sprintf(buffer, "<tr><td>&lt;%s&gt; %s</td></tr>", nick, message);
+				sprintf(buffer, "<tr><td>%d &lt;%s&gt; %s</td></tr>", (int)time, nick, message);
 
 				ss_add(&ss, buffer);
 

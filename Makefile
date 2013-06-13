@@ -8,7 +8,7 @@ OBJDIR=obj
 BINDIR=bin
 INCDIR=include
 
-CFLAGS=-c -Wall -g
+CFLAGS=-c -Wall -g -O2
 LDFLAGS=-L/usr/local/lib/ -lmicrohttpd -lsqlite3
 SOURCES=$(patsubst %.c, $(SRCDIR)/%.c, $(SOURCEFILES))
 OBJECTS=$(patsubst %.c, $(OBJDIR)/%.o, $(SOURCEFILES))
