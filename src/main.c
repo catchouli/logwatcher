@@ -17,7 +17,7 @@
 #include "queries.h"
 #include "stringstream.h"
 
-#define PORT     9003
+#define PORT     9002
 #define LOGFILE  "/home/rena/irclogs/renaporn/#talkhaus.log"
 
 #define LOAD_LOG_INITIAL 1
@@ -259,6 +259,30 @@ void parse_line(const char* line)
 		// Delete statement
 		sqlite3_finalize(statement);
 
+		// Check that a row was modified
+		if (sqlite3_changes(db) == 0)
+		{
+			// If not, insert initial row
+			rc = sqlite3_prepare_v2(db, INSERT_MESSAGE_COUNT, -1, &statement, NULL);
+			if (rc != SQLITE_OK)
+			{
+				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+			}
+
+			// Bind values
+			sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
+
+			// Run statement
+			rc = sqlite3_step(statement);
+			if (rc != SQLITE_DONE)
+			{
+				fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+			}
+
+			// Delete statement
+			sqlite3_finalize(statement);
+		}
+
 		// Increment total message count
 		sqlite_messages++;
 	}
@@ -314,10 +338,8 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 
 	// Iterate through results
 	rc = sqlite3_step(statement);
-	printf("RC: %d\n", rc);
 	while (rc == SQLITE_ROW)
 	{
-		ss_add(&ss, "test");
 		const unsigned char* nick;
 		int messages;
 
@@ -337,7 +359,6 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	{
 		fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
 	}
-ss_add(&ss, "Test2");
 
 	// Finalise query
 	sqlite3_finalize(statement);
@@ -396,9 +417,6 @@ ss_add(&ss, "Test2");
 	// End table
 	ss_add(&ss, "</table>");
 
-	printf(buffer, "Number of rows in users: %d", count_sql("users"));
-	ss_add(&ss, buffer);
-
 	// Delete statement
 	sqlite3_finalize(statement);
 
@@ -407,7 +425,7 @@ ss_add(&ss, "Test2");
 	time_taken = ((double)(finish - start))/CLOCKS_PER_SEC;
 
 	// Generate footer
-	sprintf(buffer, "Row count: %d<br>Time taken to generate: %g seconds", sqlite_messages, time_taken);
+	sprintf(buffer, "<p>Row count: %d<br>Time taken to generate: %g seconds</p>", sqlite_messages, time_taken);
 
 	// Write footer
 	ss_add(&ss, "<br>");
@@ -462,7 +480,7 @@ int execute_sql(const char* sql)
 
 int count_sql(const char* table)
 {
-	int count;                       // Row count
+	int count = 0;                   // Row count
 	int rc;                          // Return code
 	sqlite3_stmt* statement = NULL;  // Pepared statement
 
@@ -470,8 +488,7 @@ int count_sql(const char* table)
 	rc = sqlite3_prepare_v2(db, "Select Count(*) FROM users;", -1, &statement, NULL);
 	if (rc != SQLITE_OK)
 	{
-		fprintf(stderr, SQLITE_TABLE_CREATION_FAILURE, sqlite3_errmsg(db));
-		return SQLITE_TABLE_CREATION_FAILURE_ID;
+		fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
 	}
 
 	// Bind table name
@@ -479,10 +496,18 @@ int count_sql(const char* table)
 
 	// Execute statement
 	rc = sqlite3_step(statement);
+	if (rc == SQLITE_ROW)
+	{
+		count = sqlite3_column_int(statement, 0);
+
+		// This should set rc to SQLITE_DONE (count should only return one row)
+		rc = sqlite3_step(statement);
+	}
+
 	if (rc != SQLITE_DONE)
 	{
-		fprintf(stderr, SQLITE_TABLE_CREATION_FAILURE, sqlite3_errmsg(db));
-		return SQLITE_TABLE_CREATION_FAILURE_ID;
+		fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+		fprintf(stderr, "Count returned more than one row?\n");
 	}
 
 	// Get row count
@@ -494,5 +519,5 @@ int count_sql(const char* table)
 	// Delete statement
 	sqlite3_finalize(statement);
 
-	return 0;
+	return count;
 }
