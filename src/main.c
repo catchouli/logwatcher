@@ -125,6 +125,8 @@ int main(int argc, char** argv)
 	// Initialise database
 	printf("Creating database tables...\n");
 	execute_sql(TABLE_CREATION);
+//	execute_sql("CREATE INDEX messages_index ON messages;");
+//	execute_sql("CREATE INDEX users_index ON users");
 
 	// Iterate through lines
 	printf("Parsing logfile...\n");
@@ -135,6 +137,10 @@ int main(int argc, char** argv)
 	// Deallocate memory
 	free(logfile_new_text);
 	logfile_new_text = NULL;
+
+	// Vacuum database
+	printf("Vacuuming database...");
+	execute_sql("VACUUM;");
 
 	// Wait for changes
 	printf("Waiting for new messages...\n");
@@ -351,6 +357,9 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	const int max_highscore_users = 20;    // Number of users to show in the message count highscores
 	const int max_extended_hs = 20;        // Number of extended highscores to show
 	const int random_message_count = 10;   // Number of random messages wanted
+
+	// Begin transaction
+	execute_sql("BEGIN TRANSACTION;");
 
 	// Initialise start time
 	start = clock();
@@ -590,6 +599,8 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	ss_add(&ss, buffer);
 	ss_add(&ss, "</body></html>");
 
+	execute_sql("END TRANSACTION;");
+
 	// Create response
 	response = MHD_create_response_from_buffer(strlen(ss.buffer), (void*)ss.buffer, MHD_RESPMEM_PERSISTENT);
 
@@ -611,16 +622,16 @@ int execute_sql(const char* sql)
 		rc = sqlite3_prepare_v2(db, pos, -1, &statement, NULL);
 		if (rc != SQLITE_OK)
 		{
-			fprintf(stderr, SQLITE_TABLE_CREATION_FAILURE, sqlite3_errmsg(db));
-			return SQLITE_TABLE_CREATION_FAILURE_ID;
+			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+			return SQLITE_QUERY_FAILURE_ID;
 		}
 
 		// Execute statement
 		rc = sqlite3_step(statement);
 		if (rc != SQLITE_DONE)
 		{
-			fprintf(stderr, SQLITE_TABLE_CREATION_FAILURE, sqlite3_errmsg(db));
-			return SQLITE_TABLE_CREATION_FAILURE_ID;
+			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+			return SQLITE_QUERY_FAILURE_ID;
 		}
 
 		// Reset statement

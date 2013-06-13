@@ -1,8 +1,10 @@
 #ifndef __QUERIES_H__
 #define __QUERIES_H__
 
-#define TABLE_CREATION                   "CREATE TABLE messages(id INTEGER PRIMARY KEY, nick text, message text, time DATE);" \
-                                         "CREATE TABLE users(id INTEGER PRIMARY KEY, nick text, messages int, lastseen DATE);"
+#define TABLE_CREATION                   "CREATE TABLE messages(id INTEGER PRIMARY KEY, nick text collate nocase, message text, time DATE);" \
+                                         "CREATE TABLE users(id INTEGER PRIMARY KEY, nick text collate nocase, messages int, lastseen DATE);" \
+                                         "CREATE INDEX messages_index ON messages (id, nick, message);" \
+                                         "CREATE INDEX users_index ON users (nick, messages, lastseen);"
 #define ADD_MESSAGE                      "INSERT INTO messages (nick, message, time) VALUES (?, ?, ?);"
 #define SELECT_MESSAGE_AT_POSITION       "SELECT time, nick, message FROM messages LIMIT 1 OFFSET ?;"
 #define SELECT_USER_MESSAGE_AT_POSITION  "SELECT message FROM messages WHERE nick=? LIMIT 1 OFFSET ?;"
