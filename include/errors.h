@@ -22,4 +22,7 @@
 #define SQLITE_STATEMENT_PREPERATION_FAILURE    "Failed to create prepared statement: %s\n"
 #define SQLITE_STATEMENT_PREPERATION_FAILURE_ID 7
 
+#define SQLITE_EXTENSION_LOADING_FAILURE        "Failed to load extensions: %s\n"
+#define SQLITE_EXTENSION_LOADING_FAILURE_ID     8
+
 #endif /* __ERRORS_H__ */

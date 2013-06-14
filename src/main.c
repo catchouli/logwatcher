@@ -19,8 +19,10 @@
 #include "queries.h"
 #include "stringstream.h"
 
-#define PORT     9002
+#define PORT     9003
 #define LOGFILE  "/home/rena/irclogs/renaporn/#talkhaus.log"
+//#define LOGFILE  "/home/rena/irclogs/1272/#srs_bsns.log"
+#define DATABASE ":memory:"
 
 #define LOAD_LOG_INITIAL 1
 #define MAX_LOG_MESSAGES -1
@@ -43,6 +45,10 @@ int execute_sql(const char* sql);
 
 // Get count of rows in table
 int count_sql(const char* table);
+
+// Timer thing
+void timer_start();
+void timer_end();
 
 // Globals
 sqlite3* db;                  // Sqlite database
@@ -115,18 +121,32 @@ int main(int argc, char** argv)
 
 	// Create sqlite database
 	printf("Creating database...\n");
-	rc = sqlite3_open(":memory:", &db);
+	rc = sqlite3_open(DATABASE, &db);
 	if (rc)
 	{
 		fprintf(stderr, SQLITE_DATABASE_CREATION_FAILURE, sqlite3_errmsg(db));
 		return SQLITE_DATABASE_CREATION_FAILURE_ID;
 	}
 
+	// Load extensions
+	printf("Loading sqlite extensions...\n");
+
+	// Enable extension loading
+	sqlite3_enable_load_extension(db, 1);
+
+	// Load extension functions
+	rc = sqlite3_load_extension(db, "extension-functions.so", 0, &sqlite_error);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, SQLITE_EXTENSION_LOADING_FAILURE, sqlite_error);
+	}
+
+	// Disable extension loading
+	sqlite3_enable_load_extension(db, 1);
+
 	// Initialise database
 	printf("Creating database tables...\n");
 	execute_sql(TABLE_CREATION);
-//	execute_sql("CREATE INDEX messages_index ON messages;");
-//	execute_sql("CREATE INDEX users_index ON users");
 
 	// Iterate through lines
 	printf("Parsing logfile...\n");
@@ -137,10 +157,6 @@ int main(int argc, char** argv)
 	// Deallocate memory
 	free(logfile_new_text);
 	logfile_new_text = NULL;
-
-	// Vacuum database
-	printf("Vacuuming database...");
-	execute_sql("VACUUM;");
 
 	// Wait for changes
 	printf("Waiting for new messages...\n");
@@ -212,27 +228,32 @@ void parse_line(const char* line)
 	int hour;
 	int minute;
 
-	char nick[8192];       // Nickname
-	char message[8192];    // Message text
-
 	int rc;                // Return code
 	int rc2;               // Return code
 
 	hour = 0;
 	minute = 0;
-	strcpy(nick, "nick");
-	strcpy(message, "message");
+
+	char* nick = NULL;     // Nickname
+	char* message = NULL;  // Message
+
+	int line_len = strlen(line);
+
+	// Allocate sscanf buffers
+	nick = malloc(line_len);
+	message = malloc(line_len);
 
 	// Parse log open and day change message
 	rc = sscanf(line, "--- Log opened %*s %s %d %*d:%*d:%*d %d", month, &date, &year);
 	rc2 = sscanf(line, "--- Day changed %*s %s %d %d", month, &date, &year);
 	if (rc == 3 || rc2 == 3)
 	{
-		char buffer[1024];
+		const int buffer_len = 1024;
+		char buffer[buffer_len];
 		struct tm time_struct;
 
 		// Create date string
-		sprintf(buffer, "%d %s %d", date, month, year);
+		snprintf(buffer, buffer_len, "%d %s %d", date, month, year);
 
 		// Parse date string
 		if (strptime(buffer, "%d %b %Y", &time_struct) == NULL)
@@ -245,11 +266,12 @@ void parse_line(const char* line)
 		// Convert day to unix time
 		current_day = mktime(&time_struct);
 
-		return;
+		goto cleanup;
 	}
 
 	// Parse message string
 	rc = sscanf(line, "%d:%d <%[^>]> %[^\n]", &hour, &minute, nick, message);
+
 	if (rc == 4)
 	{
 		sqlite3_stmt* statement;
@@ -328,8 +350,12 @@ void parse_line(const char* line)
 		// Increment total message count
 		sqlite_messages++;
 
-		return;
+		goto cleanup;
 	}
+
+cleanup:
+	free(nick);
+	free(message);
 }
 
 int generate_statistics(void *cls, struct MHD_Connection *connection,
@@ -338,8 +364,9 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
                           const char *upload_data,
                           size_t *upload_data_size, void **con_cls)
 {
-	int i, j;                                 // Counters
-	char buffer[8192];                     // String buffer
+	int i, j;                              // Counters
+	const int buffer_len = 8192;           // String buffer length
+	char buffer[buffer_len];               // String buffer
 
 	int rc;                                // Return code
 	sqlite3_stmt* statement;               // Sqlite prepared statement
@@ -353,10 +380,47 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	clock_t start, finish;                 // Structures for timing
 	double time_taken;                     // Time taken for execution
 
+	// Query buffers for runtime generated queries
+	static int query_buffers_generated = 0;
+	static char* random_messages_query_buffer = NULL;
+
 	// Constants (which should probably be moved into a config file at some point in the future)
 	const int max_highscore_users = 20;    // Number of users to show in the message count highscores
 	const int max_extended_hs = 20;        // Number of extended highscores to show
 	const int random_message_count = 10;   // Number of random messages wanted
+
+	// Generate static query buffers on first run
+	if (query_buffers_generated == 0)
+	{
+		struct stringstream ss;
+
+		printf("Generating query buffers on first run\n");
+
+		// Generate random messages buffer
+		ss = ss_create();
+
+		// Add initial string
+		ss_add(&ss, SELECT_RANDOM_MESSAGES_START);
+
+		// Add conditions (1 for each wanted random message)
+		for (i = 0; i < random_message_count; ++i)
+		{
+			if (i != 0)
+				ss_add(&ss, " OR ");
+
+			ss_add(&ss, SELECT_RANDOM_MESSAGES_CONDITION);
+		}
+
+		// Finish query with a semicolon
+		ss_add(&ss, ";");
+
+		// Store pointer to query
+		random_messages_query_buffer = ss.buffer;
+
+		query_buffers_generated = 1;
+
+		printf("Finished generating query buffers\n");
+	}
 
 	// Begin transaction
 	execute_sql("BEGIN TRANSACTION;");
@@ -373,6 +437,8 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	ss_add(&ss, "</head><body>");
 	ss_add(&ss, "<h1>Renaporn stats for #talkhaus</h1>");
 
+goto random_messages;
+top_users:
 	// Print out top max_highscore_users users with most messages
 	ss_add(&ss, "<h2>Users with the most messages</h2><table>");
 	ss_add(&ss, "<tr><td></td><td>Nickname</td><td>Lines</td><td>Last seen</td><td>Random quote</td></tr>");
@@ -452,7 +518,7 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 		strftime(time_string, 1024, "%d %b %Y", time_struct);
 
 		// Output data
-		sprintf(buffer, "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td><td><p>%s</p></td></tr>", i, nick, messages, time_string, random_message);
+		snprintf(buffer, buffer_len, "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td><td><p>%s</p></td></tr>", i, nick, messages, time_string, random_message);
 		ss_add(&ss, buffer);
 
 		// Free memory
@@ -495,7 +561,8 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 		ss_add(&ss, "<tr>");
 		for (j = 0; j < 5; ++j)
 		{
-			char buffer[2048];
+			const int buffer_len = 2048;
+			char buffer[buffer_len];
 
 			const char* nick;
 			int messages;
@@ -510,7 +577,7 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 				messages = sqlite3_column_int(statement, 1);
 
 				// Write nick (messages) to buffer
-				sprintf(buffer, "%s (%d)", nick, messages);
+				snprintf(buffer, buffer_len, "%s (%d)", nick, messages);
 
 				// Fetch next row
 				rc = sqlite3_step(statement);
@@ -530,6 +597,50 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	// Line break
 	ss_add(&ss, "</table><br>");
 
+random_messages:
+
+	// Print out random_message_count random rows
+	ss_add(&ss, "<h2>10 random messages from log</h2><table>");
+
+	// Create prepared statement
+	rc = sqlite3_prepare_v2(db, random_messages_query_buffer, -1, &statement, NULL);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+	}
+
+	// Execute statement
+	rc = sqlite3_step(statement);
+	while (rc == SQLITE_ROW)
+	{
+		time_t time;
+		const char* nick;
+		const char* message;
+
+		time = (time_t)sqlite3_column_int(statement, 0);
+		nick = (const char*)sqlite3_column_text(statement, 1);
+		message = (const char*)sqlite3_column_text(statement, 2);
+
+		snprintf(buffer, buffer_len, "<tr><td>%d &lt;%s&gt; %s</td></tr>", (int)time, nick, message);
+
+		ss_add(&ss, buffer);
+
+		rc = sqlite3_step(statement);
+	}
+
+	// Check if query done
+	if (rc != SQLITE_DONE)
+	{
+		fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+	}
+
+	// Finalise statement
+	sqlite3_finalize(statement);
+
+	// End table
+	ss_add(&ss, "</table>");
+
+goto footer;
 	// Print out random_message_count random rows
 	ss_add(&ss, "<h2>10 random messages from log</h2><table>");
 	if (sqlite_messages > 0)
@@ -553,6 +664,7 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 			sqlite3_bind_int(statement, 1, random_id);
 
 			// Run statement
+			timer_start();
 			rc = sqlite3_step(statement);
 			while (rc == SQLITE_ROW)
 			{
@@ -563,12 +675,13 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 				nick = sqlite3_column_text(statement, 1);
 				message = sqlite3_column_text(statement, 2);
 
-				sprintf(buffer, "<tr><td>%d &lt;%s&gt; %s</td></tr>", (int)time, nick, message);
+				snprintf(buffer, buffer_len, "<tr><td>%d &lt;%s&gt; %s</td></tr>", (int)time, nick, message);
 
 				ss_add(&ss, buffer);
 
 				rc = sqlite3_step(statement);
 			}
+			timer_end();
 
 			// Print error if statement not complete
 			if (rc != SQLITE_DONE)
@@ -587,12 +700,13 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	// Delete statement
 	sqlite3_finalize(statement);
 
+footer:
 	// Get finish time
 	finish = clock();
 	time_taken = ((double)(finish - start))/CLOCKS_PER_SEC;
 
 	// Generate footer
-	sprintf(buffer, "<p>Row count: %d<br>Time taken to generate: %g seconds</p>", sqlite_messages, time_taken);
+	snprintf(buffer, buffer_len, "<p>Row count: %d<br>Time taken to generate: %g seconds</p>", sqlite_messages, time_taken);
 
 	// Write footer
 	ss_add(&ss, "<br>");
@@ -623,6 +737,7 @@ int execute_sql(const char* sql)
 		if (rc != SQLITE_OK)
 		{
 			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+			fprintf(stderr, "Problem query is: %s\n", pos);
 			return SQLITE_QUERY_FAILURE_ID;
 		}
 
@@ -631,6 +746,7 @@ int execute_sql(const char* sql)
 		if (rc != SQLITE_DONE)
 		{
 			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+			fprintf(stderr, "Problem query is: %s\n", pos);
 			return SQLITE_QUERY_FAILURE_ID;
 		}
 
@@ -689,4 +805,22 @@ int count_sql(const char* table)
 	sqlite3_finalize(statement);
 
 	return count;
+}
+
+clock_t start, end;
+
+void timer_start()
+{
+	start = clock();
+}
+
+void timer_end()
+{
+	double time_taken;
+
+	end = clock();
+	time_taken = ((double)(end - start))/(double)CLOCKS_PER_SEC;
+
+	printf("Time taken: %f\n", time_taken);
+
 }
