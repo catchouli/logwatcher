@@ -290,6 +290,7 @@ void parse_line(const char* line)
 		sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
 		sqlite3_bind_text(statement, 2, message, -1, SQLITE_STATIC);
 		sqlite3_bind_int(statement, 3, current_day);
+		sqlite3_bind_text(statement, 4, nick, -1, SQLITE_STATIC);
 
 		// Run statement
 		rc = sqlite3_step(statement);
@@ -380,47 +381,10 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	clock_t start, finish;                 // Structures for timing
 	double time_taken;                     // Time taken for execution
 
-	// Query buffers for runtime generated queries
-	static int query_buffers_generated = 0;
-	static char* random_messages_query_buffer = NULL;
-
 	// Constants (which should probably be moved into a config file at some point in the future)
 	const int max_highscore_users = 20;    // Number of users to show in the message count highscores
 	const int max_extended_hs = 20;        // Number of extended highscores to show
 	const int random_message_count = 10;   // Number of random messages wanted
-
-	// Generate static query buffers on first run
-	if (query_buffers_generated == 0)
-	{
-		struct stringstream ss;
-
-		printf("Generating query buffers on first run\n");
-
-		// Generate random messages buffer
-		ss = ss_create();
-
-		// Add initial string
-		ss_add(&ss, SELECT_RANDOM_MESSAGES_START);
-
-		// Add conditions (1 for each wanted random message)
-		for (i = 0; i < random_message_count; ++i)
-		{
-			if (i != 0)
-				ss_add(&ss, " OR ");
-
-			ss_add(&ss, SELECT_RANDOM_MESSAGES_CONDITION);
-		}
-
-		// Finish query with a semicolon
-		ss_add(&ss, ";");
-
-		// Store pointer to query
-		random_messages_query_buffer = ss.buffer;
-
-		query_buffers_generated = 1;
-
-		printf("Finished generating query buffers\n");
-	}
 
 	// Begin transaction
 	execute_sql("BEGIN TRANSACTION;");
@@ -603,11 +567,14 @@ random_messages:
 	ss_add(&ss, "<h2>10 random messages from log</h2><table>");
 
 	// Create prepared statement
-	rc = sqlite3_prepare_v2(db, random_messages_query_buffer, -1, &statement, NULL);
+	rc = sqlite3_prepare_v2(db, SELECT_RANDOM_MESSAGES, -1, &statement, NULL);
 	if (rc != SQLITE_OK)
 	{
 		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 	}
+
+	// Bind parameters
+	sqlite3_bind_int(statement, 1, random_message_count);
 
 	// Execute statement
 	rc = sqlite3_step(statement);
