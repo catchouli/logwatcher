@@ -376,8 +376,6 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 
 	struct MHD_Response* response;         // HTTP response
 
-	int random_id;                         // Random id for selection
-
 	clock_t start, finish;                 // Structures for timing
 	double time_taken;                     // Time taken for execution
 
@@ -400,112 +398,56 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	ss_add(&ss, "<title>Renaporn stats for #talkhaus</title>");
 	ss_add(&ss, "</head><body>");
 	ss_add(&ss, "<h1>Renaporn stats for #talkhaus</h1>");
+	ss_add(&ss, "<table><tr><td></td><td>Nickname</td><td>Lines</td><td>Last seen</td><td>Random message</td></tr>");
 
-goto random_messages;
-top_users:
-	// Print out top max_highscore_users users with most messages
-	ss_add(&ss, "<h2>Users with the most messages</h2><table>");
-	ss_add(&ss, "<tr><td></td><td>Nickname</td><td>Lines</td><td>Last seen</td><td>Random quote</td></tr>");
+	// Prepare top users
+	execute_sql(PREPARE_TOP_USERS_TABLE);
 
 	// Create statement
-	rc = sqlite3_prepare_v2(db, SELECT_TOP_USERS, -1, &statement, NULL);
+	rc = sqlite3_prepare_v2(db, SELECT_TOP_USERS_TABLE, -1, &statement, NULL);
 	if (rc != SQLITE_OK)
 	{
 		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 	}
 
-	// Bind parameters
-	sqlite3_bind_int(statement, 1, max_highscore_users);
-
-	// Iterate through results
+	// Run query
 	i = 0;
 	rc = sqlite3_step(statement);
 	while (rc == SQLITE_ROW)
 	{
-		int rc2;
-		int random_id;
-		char* random_message = NULL;
-
-		char time_string[1024];
-		const char* nick;
+		time_t lastseen;
 		int messages;
-		time_t time;
-		struct tm* time_struct;
+		const char* nick;
+		const char* message;
 
-		sqlite3_stmt* statement2;
+		i++;
 
-		// Get values
 		nick = (const char*)sqlite3_column_text(statement, 0);
 		messages = sqlite3_column_int(statement, 1);
-		time = sqlite3_column_int(statement, 2);
+		message = (const char*)sqlite3_column_text(statement, 2);
+		lastseen = (time_t)sqlite3_column_int(statement, 3);
 
-		// Select random message
-		random_id = rand() % messages;
+		snprintf(buffer, buffer_len, "<tr><td>%d</td><td>%s</td><td>%d</td><td>%d</td><td>%s</td></tr>", i, nick, messages, (int)lastseen, message);
 
-		// Prepare statement
-		rc2 = sqlite3_prepare_v2(db, SELECT_USER_MESSAGE_AT_POSITION, -1, &statement2, NULL);
-		if (rc2 != SQLITE_OK)
-		{
-			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
-		}
-
-		// Bind parameters
-		sqlite3_bind_text(statement2, 1, nick, -1, SQLITE_STATIC);
-		sqlite3_bind_int(statement2, 2, random_id);
-
-		// Execute query
-		rc2 = sqlite3_step(statement2);
-		if (rc2 == SQLITE_ROW)
-		{
-			// Get string
-			const char* msg = (const char*)sqlite3_column_text(statement2, 0);
-
-			// Copy string
-			random_message = malloc(strlen(msg) + 1);
-			strcpy(random_message, msg);
-
-			// Should equal SQLITE_DONE
-			rc2 = sqlite3_step(statement2);
-		}
-
-		// Check if done
-		if (rc2 != SQLITE_DONE)
-		{
-			fprintf(stderr, "Statement should be done by now but rc != SQLITE_DONE");
-		}
-
-		// Finalise statement
-		sqlite3_finalize(statement2);
-
-		// Work out time string
-		time_struct = gmtime(&time);
-		strftime(time_string, 1024, "%d %b %Y", time_struct);
-
-		// Output data
-		snprintf(buffer, buffer_len, "<tr><td>%d</td><td>%s</td><td>%d</td><td>%s</td><td><p>%s</p></td></tr>", i, nick, messages, time_string, random_message);
 		ss_add(&ss, buffer);
 
-		// Free memory
-		free(random_message);
-
-		// Get next row
-		i++;
 		rc = sqlite3_step(statement);
 	}
 
+	// Make sure query completed successfully
 	if (rc != SQLITE_DONE)
 	{
-		fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 	}
 
-	// Finalise query
-	sqlite3_finalize(statement);
+	// Finalise statement
+	rc = sqlite3_finalize(statement);
 
 	// End table
-	ss_add(&ss, "</table><br><h3>These users didn't quite make it");
+	ss_add(&ss, "</table><h3>Users who didn't quite make it</h3>");
 
 	// Extended highscores table
-	rc = sqlite3_prepare_v2(db, SELECT_TOP_USERS_EXT, -1, &statement, NULL);
+	rc = sqlite3_prepare_v2(db, SELECT_TOP_USERS, -1, &statement, NULL);
 	if (rc != SQLITE_OK)
 	{
 		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
@@ -561,8 +503,6 @@ top_users:
 	// Line break
 	ss_add(&ss, "</table><br>");
 
-random_messages:
-
 	// Print out random_message_count random rows
 	ss_add(&ss, "<h2>10 random messages from log</h2><table>");
 
@@ -607,67 +547,6 @@ random_messages:
 	// End table
 	ss_add(&ss, "</table>");
 
-goto footer;
-	// Print out random_message_count random rows
-	ss_add(&ss, "<h2>10 random messages from log</h2><table>");
-	if (sqlite_messages > 0)
-	{
-		// Create prepared statement
-		rc = sqlite3_prepare_v2(db, SELECT_MESSAGE_AT_POSITION, -1, &statement, NULL);
-		if (rc != SQLITE_OK)
-		{
-			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
-		}
-
-		// Iterate random_message_count times, selecting a row each time
-		for (i = 0; i < random_message_count; ++i)
-		{
-			time_t time;
-
-			// Select random id
-			random_id = rand() % sqlite_messages;
-
-			// Bind parameters
-			sqlite3_bind_int(statement, 1, random_id);
-
-			// Run statement
-			timer_start();
-			rc = sqlite3_step(statement);
-			while (rc == SQLITE_ROW)
-			{
-				const unsigned char* nick;
-				const unsigned char* message;
-
-				time = sqlite3_column_int(statement, 0);
-				nick = sqlite3_column_text(statement, 1);
-				message = sqlite3_column_text(statement, 2);
-
-				snprintf(buffer, buffer_len, "<tr><td>%d &lt;%s&gt; %s</td></tr>", (int)time, nick, message);
-
-				ss_add(&ss, buffer);
-
-				rc = sqlite3_step(statement);
-			}
-			timer_end();
-
-			// Print error if statement not complete
-			if (rc != SQLITE_DONE)
-			{
-				fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-			}
-
-			// reset statement for next request
-			sqlite3_reset(statement);
-		}
-	}
-
-	// End table
-	ss_add(&ss, "</table>");
-
-	// Delete statement
-	sqlite3_finalize(statement);
-
-footer:
 	// Get finish time
 	finish = clock();
 	time_taken = ((double)(finish - start))/CLOCKS_PER_SEC;
