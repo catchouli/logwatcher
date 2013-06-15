@@ -366,10 +366,10 @@ void parse_line(const char* line)
 		char buffer[buffer_len];
 
 		// Create date string
-		snprintf(buffer, buffer_len, "%d %s %d", date, month, year);
+		snprintf(buffer, buffer_len, "%d %s %d 00:00:00", date, month, year);
 
-		// Parse date string
-		if (strptime(buffer, "%d %b %Y", &time_struct) == NULL)
+		// Parse date string %b
+		if (strptime(buffer, "%d %b %Y %H:%M:%S", &time_struct) == NULL)
 		{
 			fprintf(stderr, "Failed to parse date format %s\n", buffer);
 
