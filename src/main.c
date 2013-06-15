@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 600
+#define _XOPEN_SOURCE 700
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -20,14 +20,8 @@
 #include "queries.h"
 #include "stringstream.h"
 
-#define PORT     9003
-#define LOGFILE  "/home/rena/irclogs/renaporn/#talkhaus.log"
-//#define LOGFILE  "/home/rena/irclogs/1272/#srs_bsns.log"
 #define DATABASE ":memory:"
 #define CONFIG_FILE "logwatcher.conf"
-
-#define LOAD_LOG_INITIAL 1
-#define MAX_LOG_MESSAGES -1
 
 // Parse lines of log
 void parse_lines(char* lines);
@@ -60,6 +54,11 @@ int sqlite_messages = 0;      // Messages in message table
 
 time_t current_day = 0;       // Current day (last encountered in log)
 
+// Configuration variables
+const char* network;
+const char* channel;
+const char* logfile;
+
 // Entry point
 int main(int argc, char** argv)
 {
@@ -74,8 +73,12 @@ int main(int argc, char** argv)
 	FILE* logfile_fd;                // File descriptor for logfile
 	long logfile_len;                // Logfile length
 	char* logfile_new_text = NULL;   // New logfile data
+	size_t data_read;                // Amount of data read by getline
+	char* line;                      // Pointer to getline buffer
+	size_t size;                     // Size of getline buffer
 
 	struct MHD_Daemon* daemon;       // microhttpd daemon
+	int port = 0;                    // httpd port
 
 	int rc;                          // Return code
 
@@ -90,6 +93,22 @@ int main(int argc, char** argv)
 		return CONFIG_LOAD_FAILURE_ID;
 	}
 
+	// Load channel name
+	setting = config_lookup(&config, "logwatcher.channel");
+	channel = config_setting_get_string(setting);
+
+	// Load network name
+	setting = config_lookup(&config, "logwatcher.network");
+	network = config_setting_get_string(setting);
+
+	// Load logfile name
+	setting = config_lookup(&config, "logwatcher.logfile");
+	logfile = config_setting_get_string(setting);
+
+	// Load port
+	setting = config_lookup(&config, "logwatcher.port");
+	port = config_setting_get_int(setting);
+
 	// Initialise inotify
 	printf("Initialising inotify...\n");
 	inotify_fd = inotify_init();
@@ -102,7 +121,7 @@ int main(int argc, char** argv)
 
 	// Add a watch to logfile
 	printf("Watching logfile...\n");
-	inotify_wd = inotify_add_watch(inotify_fd, LOGFILE, IN_MODIFY);
+	inotify_wd = inotify_add_watch(inotify_fd, logfile, IN_MODIFY);
 
 	if (inotify_wd < 0)
 	{
@@ -111,24 +130,17 @@ int main(int argc, char** argv)
 	}
 
 	// Get logfile length
-	logfile_fd = fopen(LOGFILE, "r");
+	logfile_fd = fopen(logfile, "r");
 	fseek(logfile_fd, 0, SEEK_END);
 	logfile_len = ftell(logfile_fd);
 
 	// Read logfile
 	printf("Reading logfile...\n");
 	fseek(logfile_fd, 0, SEEK_SET);
-	logfile_new_text = malloc(logfile_len);
-
-	rc = fread(logfile_new_text, 1, logfile_len, logfile_fd);
-	if (rc <= 0)
-	{
-		printf("%s %d\n", "No data read from logfile", errno);
-	}
 
 	// Initialise httpd
 	printf("Initialising httpd...\n");
-	daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, PORT, NULL, NULL,
+	daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, port, NULL, NULL,
 					&generate_statistics, NULL, MHD_OPTION_END);
 	if (daemon == NULL)
 	{
@@ -245,8 +257,19 @@ int main(int argc, char** argv)
 
 	// Iterate through lines
 	printf("Parsing logfile...\n");
-	if (LOAD_LOG_INITIAL)
-		parse_lines(logfile_new_text);
+	line = NULL;
+	while ((data_read = getline(&line, &size, logfile_fd)) != -1)
+	{
+		if (line != NULL)
+		{
+			// Parse line
+			parse_line(line);
+
+			// Free memory allocated by getline
+			free(line);
+			line = NULL;
+		}
+	}
 	printf("Finished parsing logfile.\n");
 
 	// Deallocate memory
@@ -293,21 +316,12 @@ int main(int argc, char** argv)
 
 void parse_lines(char* lines)
 {
-	int messages = 0;
-
 	char* position;
 
 	// Iterate through lines
 	position = strtok(lines, "\n");
 	while (position != NULL)
 	{
-		if (MAX_LOG_MESSAGES >= 0)
-		{
-			messages++;
-			if (messages > MAX_LOG_MESSAGES)
-				break;
-		}
-
 		// Parse line from log
 		parse_line(position);
 
@@ -546,9 +560,15 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 
 	// Write start of page
 	ss_add(&ss, "<html><head><link rel=\"stylesheet\" href=\"http://www.renaporn.com/~rena/stats.css\">");
-	ss_add(&ss, "<title>Renaporn stats for #talkhaus</title>");
+
+	// Format channel name and network for title
+	snprintf(buffer, buffer_len, "<title>Stats for %s at %s</title>", channel, network);
+	ss_add(&ss, buffer);
+
+	// Format channel name and network for page
+	snprintf(buffer, buffer_len, "<h1>Stats for %s at %s</h1>", channel, network);
 	ss_add(&ss, "</head><body>");
-	ss_add(&ss, "<h1>Renaporn stats for #talkhaus</h1>");
+	ss_add(&ss, buffer);
 	ss_add(&ss, "<table><tr><td></td><td style=\"width: 110px\">Nickname</td><td style=\"width: 50px;\">Lines</td><td style=\"width: 90px;\">Last seen</td><td style=\"width: 500px;\">Random message</td></tr>");
 
 	// Clear top users
