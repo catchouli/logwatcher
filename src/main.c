@@ -193,7 +193,7 @@ int main(int argc, char** argv)
 
 		k = 0;
 
-		printf("Loading %d sets aliases...\n", config_array_len);
+		printf("Loading aliases...\n", config_array_len);
 		for (i = 0; i < config_array_len; ++i)
 		{
 			const config_setting_t* inner_array;
