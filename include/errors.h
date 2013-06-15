@@ -25,4 +25,10 @@
 #define SQLITE_EXTENSION_LOADING_FAILURE        "Failed to load extensions: %s\n"
 #define SQLITE_EXTENSION_LOADING_FAILURE_ID     8
 
+#define SQLITE_PROBLEM_QUERY                    "Problem query: %s\n"
+#define SQLITE_PROBLEM_QUERY_ID                 9
+
+#define CONFIG_LOAD_FAILURE                     "Failed to load config file: %s at line %d\n"
+#define CONFIG_LOAD_FAILURE_ID                  10
+
 #endif /* __ERRORS_H__ */

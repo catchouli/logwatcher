@@ -9,7 +9,7 @@ BINDIR=bin
 INCDIR=include
 
 CFLAGS=-c -Wall -g
-LDFLAGS=-L/usr/local/lib/ -lmicrohttpd -lsqlite3
+LDFLAGS=-lmicrohttpd -lsqlite3 -lconfig
 SOURCES=$(patsubst %.c, $(SRCDIR)/%.c, $(SOURCEFILES))
 OBJECTS=$(patsubst %.c, $(OBJDIR)/%.o, $(SOURCEFILES))
 OUTPUT=$(BINDIR)/$(EXECUTABLE)
