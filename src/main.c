@@ -20,7 +20,6 @@
 #include "queries.h"
 #include "stringstream.h"
 
-#define DATABASE ":memory:"
 #define CONFIG_FILE "logwatcher.conf"
 
 // Parse lines of log
@@ -53,8 +52,10 @@ char* sqlite_error = NULL;    // Sqlite error
 int sqlite_messages = 0;      // Messages in message table
 
 time_t current_day = 0;       // Current day (last encountered in log)
+time_t latest_time = 0;       // Latest time encountered
 
 // Configuration variables
+const char* database_filename;
 const char* network;
 const char* channel;
 const char* logfile;
@@ -72,7 +73,6 @@ int main(int argc, char** argv)
 
 	FILE* logfile_fd;                // File descriptor for logfile
 	long logfile_len;                // Logfile length
-	char* logfile_new_text = NULL;   // New logfile data
 	size_t data_read;                // Amount of data read by getline
 	char* line;                      // Pointer to getline buffer
 	size_t size;                     // Size of getline buffer
@@ -81,6 +81,7 @@ int main(int argc, char** argv)
 	int port = 0;                    // httpd port
 
 	int rc;                          // Return code
+	sqlite3_stmt* statement;         // Sqlite statement
 
 	// Initialise config struct
 	config_init(&config);
@@ -93,13 +94,17 @@ int main(int argc, char** argv)
 		return CONFIG_LOAD_FAILURE_ID;
 	}
 
-	// Load channel name
-	setting = config_lookup(&config, "logwatcher.channel");
-	channel = config_setting_get_string(setting);
+	// Load database filename
+	setting = config_lookup(&config, "logwatcher.database_filename");
+	database_filename = config_setting_get_string(setting);
 
 	// Load network name
 	setting = config_lookup(&config, "logwatcher.network");
 	network = config_setting_get_string(setting);
+
+	// Load channel name
+	setting = config_lookup(&config, "logwatcher.channel");
+	channel = config_setting_get_string(setting);
 
 	// Load logfile name
 	setting = config_lookup(&config, "logwatcher.logfile");
@@ -150,7 +155,7 @@ int main(int argc, char** argv)
 
 	// Create sqlite database
 	printf("Creating database...\n");
-	rc = sqlite3_open(DATABASE, &db);
+	rc = sqlite3_open(database_filename, &db);
 	if (rc)
 	{
 		fprintf(stderr, SQLITE_DATABASE_CREATION_FAILURE, sqlite3_errmsg(db));
@@ -174,8 +179,74 @@ int main(int argc, char** argv)
 	sqlite3_enable_load_extension(db, 1);
 
 	// Initialise database
-	printf("Creating database tables...\n");
-	execute_sql(TABLE_CREATION);
+	printf("Creating database tables if non existent...\n");
+	rc = execute_sql(TABLE_CREATION);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, "Failed to initialise database, terminating.\n");
+		return -1;
+	}
+
+	// Get latest message time from database
+	latest_time = 0;
+
+	// Prepare statement
+	rc = sqlite3_prepare_v2(db, SELECT_LATEST_MESSAGES, -1, &statement, NULL);
+	if (rc != SQLITE_OK)
+	{
+		fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+		return SQLITE_STATEMENT_PREPERATION_FAILURE_ID;
+	}
+
+	// Bind parameters
+	sqlite3_bind_int(statement, 1, 1);       // Number of messages to retrieve (1)
+
+	// Run statement
+	rc = sqlite3_step(statement);
+	if (rc == SQLITE_ROW)
+	{
+		latest_time = (time_t)sqlite3_column_int(statement, 0);
+
+		printf("Got latest time from database: %d\n", (int)latest_time);
+
+		rc = sqlite3_step(statement);
+	}
+	else
+	{
+		printf("Creating new db");
+	}
+
+	// Clean up statement
+	sqlite3_finalize(statement);
+
+        // Get total message count
+	sqlite_messages = 0;
+
+        // Prepare statement
+        rc = sqlite3_prepare_v2(db, SELECT_MESSAGE_COUNT, -1, &statement, NULL);
+        if (rc != SQLITE_OK)
+        {
+                fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+                return SQLITE_STATEMENT_PREPERATION_FAILURE_ID;
+        }
+
+        // Run statement
+        rc = sqlite3_step(statement);
+        if (rc == SQLITE_ROW)
+        {
+                sqlite_messages = sqlite3_column_int(statement, 0);
+
+                printf("Got message count: %d\n", sqlite_messages);
+
+                rc = sqlite3_step(statement);
+        }
+        else
+        {
+                printf("Creating new db");
+        }
+
+        // Clean up statement
+        sqlite3_finalize(statement);
 
 	// Read aliases from config file
 	setting = config_lookup(&config, "logwatcher.aliases");
@@ -193,7 +264,7 @@ int main(int argc, char** argv)
 
 		k = 0;
 
-		printf("Loading aliases...\n", config_array_len);
+		printf("Loading aliases...\n");
 		for (i = 0; i < config_array_len; ++i)
 		{
 			const config_setting_t* inner_array;
@@ -257,6 +328,12 @@ int main(int argc, char** argv)
 
 	// Iterate through lines
 	printf("Parsing logfile...\n");
+
+	if (latest_time > 0)
+	{
+		printf("Skipping to new messages...\n");
+	}
+
 	line = NULL;
 	while ((data_read = getline(&line, &size, logfile_fd)) != -1)
 	{
@@ -270,11 +347,8 @@ int main(int argc, char** argv)
 			line = NULL;
 		}
 	}
+	logfile_len = ftell(logfile_fd);
 	printf("Finished parsing logfile.\n");
-
-	// Deallocate memory
-	free(logfile_new_text);
-	logfile_new_text = NULL;
 
 	// Wait for changes
 	printf("Waiting for new messages...\n");
@@ -390,33 +464,37 @@ void parse_line(const char* line)
 		time_t time;
 		sqlite3_stmt* statement;
 
-		// Add topic to database
-		rc = sqlite3_prepare_v2(db, INSERT_TOPIC, -1, &statement, NULL);
-		if (rc != SQLITE_OK)
-		{
-			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_TOPIC);
-			goto cleanup;
-		}
-
 		// Work out time
 		time = current_day + hour * 3600 + minute * 60;
 
-		// Bind values
-		sqlite3_bind_int(statement, 1, (int)time);
-		sqlite3_bind_text(statement, 2, nick, -1, SQLITE_STATIC);
-		sqlite3_bind_text(statement, 3, message, -1, SQLITE_STATIC);
-
-		// Insert
-		rc = sqlite3_step(statement);
-		if (rc != SQLITE_DONE)
+		// Skip if from the past
+		if (time > latest_time)
 		{
-			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_TOPIC);
-		}
+			// Add topic to database
+			rc = sqlite3_prepare_v2(db, INSERT_TOPIC, -1, &statement, NULL);
+			if (rc != SQLITE_OK)
+			{
+				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_TOPIC);
+				goto cleanup;
+			}
 
-		// Finalise query
-		sqlite3_finalize(statement);
+			// Bind values
+			sqlite3_bind_int(statement, 1, (int)time);
+			sqlite3_bind_text(statement, 2, nick, -1, SQLITE_STATIC);
+			sqlite3_bind_text(statement, 3, message, -1, SQLITE_STATIC);
+
+			// Insert
+			rc = sqlite3_step(statement);
+			if (rc != SQLITE_DONE)
+			{
+				fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_TOPIC);
+			}
+
+			// Finalise query
+			sqlite3_finalize(statement);
+		}
 
 		goto cleanup;
 	}
@@ -431,89 +509,91 @@ void parse_line(const char* line)
 		// Remove first character from nick (op char)
 		strcpy(nick, nick+1);
 
-		// Add message to database
-		rc = sqlite3_prepare_v2(db, INSERT_MESSAGE, -1, &statement, NULL);
-		if (rc != SQLITE_OK)
-		{
-			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE);
-			goto cleanup;
-		}
-
 		// Calculate time
 		time = current_day + hour * 3600 + minute * 60;
 
-		// Bind values
-		sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
-		sqlite3_bind_text(statement, 2, message, -1, SQLITE_STATIC);
-		sqlite3_bind_int(statement, 3, time);
-		//sqlite3_bind_text(statement, 4, nick, -1, SQLITE_STATIC);
-
-		// Run statement
-		rc = sqlite3_step(statement);
-		if (rc != SQLITE_DONE)
+		if (time > latest_time)
 		{
-			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE);
-		}
-
-		// Delete statement
-		sqlite3_finalize(statement);
-
-		// Increment message count for user
-		rc = sqlite3_prepare_v2(db, INCREMENT_MESSAGE_COUNT, -1, &statement, NULL);
-		if (rc != SQLITE_OK)
-		{
-			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, INCREMENT_MESSAGE_COUNT);
-			goto cleanup;
-		}
-
-		// Bind values
-		sqlite3_bind_int(statement, 1, time);
-		sqlite3_bind_text(statement, 2, nick, -1, SQLITE_STATIC);
-
-		// Run statement
-		rc = sqlite3_step(statement);
-		if (rc != SQLITE_DONE)
-		{
-			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, INCREMENT_MESSAGE_COUNT);
-		}
-
-		// Delete statement
-		sqlite3_finalize(statement);
-
-		// Check that a row was modified
-		if (sqlite3_changes(db) == 0)
-		{
-			// If not, insert initial row
-			rc = sqlite3_prepare_v2(db, INSERT_MESSAGE_COUNT, -1, &statement, NULL);
+			// Add message to database
+			rc = sqlite3_prepare_v2(db, INSERT_MESSAGE, -1, &statement, NULL);
 			if (rc != SQLITE_OK)
 			{
 				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
-				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE_COUNT);
+				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE);
 				goto cleanup;
 			}
 
 			// Bind values
 			sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
-			sqlite3_bind_int(statement, 2, time);
+			sqlite3_bind_text(statement, 2, message, -1, SQLITE_STATIC);
+			sqlite3_bind_int(statement, 3, time);
 
 			// Run statement
 			rc = sqlite3_step(statement);
 			if (rc != SQLITE_DONE)
 			{
 				fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE_COUNT);
+				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE);
 			}
 
 			// Delete statement
 			sqlite3_finalize(statement);
-		}
 
-		// Increment total message count
-		sqlite_messages++;
+			// Increment message count for user
+			rc = sqlite3_prepare_v2(db, INCREMENT_MESSAGE_COUNT, -1, &statement, NULL);
+			if (rc != SQLITE_OK)
+			{
+				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+				fprintf(stderr, SQLITE_PROBLEM_QUERY, INCREMENT_MESSAGE_COUNT);
+				goto cleanup;
+			}
+
+			// Bind values
+			sqlite3_bind_int(statement, 1, time);
+			sqlite3_bind_text(statement, 2, nick, -1, SQLITE_STATIC);
+
+			// Run statement
+			rc = sqlite3_step(statement);
+			if (rc != SQLITE_DONE)
+			{
+				fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+				fprintf(stderr, SQLITE_PROBLEM_QUERY, INCREMENT_MESSAGE_COUNT);
+			}
+
+			// Delete statement
+			sqlite3_finalize(statement);
+
+			// Check that a row was modified
+			if (sqlite3_changes(db) == 0)
+			{
+				// If not, insert initial row
+				rc = sqlite3_prepare_v2(db, INSERT_MESSAGE_COUNT, -1, &statement, NULL);
+				if (rc != SQLITE_OK)
+				{
+					fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+					fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE_COUNT);
+					goto cleanup;
+				}
+
+				// Bind values
+				sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
+				sqlite3_bind_int(statement, 2, time);
+
+				// Run statement
+				rc = sqlite3_step(statement);
+				if (rc != SQLITE_DONE)
+				{
+					fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
+					fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE_COUNT);
+				}
+
+				// Delete statement
+				sqlite3_finalize(statement);
+			}
+
+			// Increment total message count
+			sqlite_messages++;
+		}
 
 		goto cleanup;
 	}
@@ -826,7 +906,7 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 	time_taken = ((double)(finish - start))/CLOCKS_PER_SEC;
 
 	// Generate footer
-	snprintf(buffer, buffer_len, "<p>Row count: %d<br>Time taken to generate: %g seconds</p>", sqlite_messages, time_taken);
+	snprintf(buffer, buffer_len, "<p>Total messages: %d<br>Time taken to generate: %g seconds</p>", sqlite_messages, time_taken);
 
 	// Write footer
 	ss_add(&ss, "<br>");
@@ -846,41 +926,20 @@ int generate_statistics(void *cls, struct MHD_Connection *connection,
 
 int execute_sql(const char* sql)
 {
-	int rc;                          // Return code
-	sqlite3_stmt* statement = NULL;  // Pepared statement
-	char* pos = (char*)sql;          // Current location in string
+	int rc;
+	char* sqlite_error = NULL;
 
-	while (pos != NULL && pos[0] != 0)
+	// Execute SQL
+	rc = sqlite3_exec(db, sql, NULL, NULL, &sqlite_error);
+	if (rc != SQLITE_OK)
 	{
-		// Prepare statement
-		rc = sqlite3_prepare_v2(db, pos, -1, &statement, NULL);
-		if (rc != SQLITE_OK)
-		{
-			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, pos);
-			return SQLITE_QUERY_FAILURE_ID;
-		}
-
-		// Execute statement
-		rc = sqlite3_step(statement);
-		if (rc != SQLITE_DONE)
-		{
-			fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
-			fprintf(stderr, SQLITE_PROBLEM_QUERY, pos);
-			return SQLITE_QUERY_FAILURE_ID;
-		}
-
-		// Reset statement
-		sqlite3_reset(statement);
-
-		// Find next statement
-		pos = strstr(pos, ";") + 1;
+		fprintf(stderr, "sqlite3_exec error: %s\n", sqlite_error);
 	}
 
-	// Delete statement
-	sqlite3_finalize(statement);
+	// Free memory
+	sqlite3_free(sqlite_error);
 
-	return 0;
+	return rc;
 }
 
 int convert_time_to_string(time_t time, char* buffer, size_t buffer_len, const char* format)

@@ -13,7 +13,7 @@
 #define SQLITE_DATABASE_CREATION_FAILURE        "Failed to create database: %s\n"
 #define SQLITE_DATABASE_CREATION_FAILURE_ID     4
 
-#define SQLITE_TABLE_CREATION_FAILURE           "Failed to create table: %s\n"
+#define SQLITE_TABLE_CREATION_FAILURE           "Failed to initialise tables, terminating.\n"
 #define SQLITE_TABLE_CREATION_FAILURE_ID        5
 
 #define SQLITE_QUERY_FAILURE                    "Sqlite query failed: %s\n"
