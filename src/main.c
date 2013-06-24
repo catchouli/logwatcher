@@ -648,7 +648,7 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 	struct timespec start, finish;         // Time structures for measuring execution time
 	float time_taken;                      // Time taken in ms
 
-	const char* default_mode = "HTML";     // The default mode for the page
+	const char* default_mode = "html";     // The default mode for the page
 	const char* mode = default_mode;       // The mode from GET("mode") or default_mode if unavailable
 
 	struct stats_user* users = NULL;        // Users array for stats_* calls
@@ -671,7 +671,7 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 	if (mode == NULL)
 		mode = default_mode;
 
-	if (strcmp(mode, "HTML") == 0)
+	if (strcmp(mode, "html") == 0)
 	{
 		// Begin transaction
 		execute_sql("BEGIN TRANSACTION;");
@@ -768,7 +768,8 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 
 		// Get finish time in ms
 		clock_gettime(CLOCK_MONOTONIC, &finish);
-		time_taken = (finish.tv_nsec - start.tv_nsec) / 1000000.0f;
+		time_taken = (finish.tv_sec - start.tv_sec) * 1000.0f +
+				 (finish.tv_nsec - start.tv_nsec) / 1000000.0f;
 
 		// Generate footer
 		snprintf(buffer, buffer_len, "<p>Total messages: %d<br>Mode: %s<br>Time taken to generate: %gms</p>", sqlite_messages, mode, time_taken);
@@ -780,9 +781,35 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 
 		execute_sql("END TRANSACTION;");
 	}
+	else if (strcmp(mode, "json") == 0)
+	{
+		// Get top users
+		rc = stats_get_top_users_full(users, max_highscore_users);
+
+		// Top of json
+		ss_add(&ss, "{ \"users\": [");
+
+		// Iterate through them and write json
+		for (i = 0; i < rc; ++i)
+		{
+			const char* top_user_format = "{ \"id\": %d, \"nick\": \"%s\", \"lines\": %d, \"message\": \"%s\" }";
+
+			snprintf(buffer, buffer_len, top_user_format, i+1, users[i].nick, users[i].lines, users[i].message);
+
+			if (i > 0)
+				ss_add(&ss, ",");
+
+			ss_add(&ss, buffer);
+		}
+
+		// Bottom of json
+		ss_add(&ss, "] }");
+	}
 
 	// Create response
 	response = MHD_create_response_from_buffer(strlen(ss.buffer), (void*)ss.buffer, MHD_RESPMEM_PERSISTENT);
+
+	MHD_add_response_header(response, "Access-Control-Allow-Origin", "http://www.renaporn.com");
 
 	rc = MHD_queue_response(connection, MHD_HTTP_OK, response);
 	MHD_destroy_response(response);
