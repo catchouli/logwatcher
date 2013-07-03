@@ -25,6 +25,7 @@
 #define PREPARE_TOP_USERS_TABLE          "INSERT INTO top_users (userid, nick, messages, lastseen) SELECT abs(random() % users.messages), nick, messages, lastseen FROM users ORDER BY messages DESC LIMIT ?;"
 #define SELECT_TOP_USERS_TABLE           "SELECT top_users.nick, top_users.messages, messages.message, top_users.lastseen FROM top_users LEFT JOIN messages ON top_users.userid = messages.userid AND top_users.nick == messages.nick ORDER BY messages DESC;"
 #define SELECT_LATEST_MESSAGES           "SELECT time, nick, message FROM messages ORDER BY time DESC LIMIT ?;"
+#define SELECT_MESSAGE_COUNT_AT_TIME     "SELECT Count(*) FROM messages WHERE time=? ORDER BY id ASC;"
 #define SELECT_LATEST_TOPICS             "SELECT time, nick, topic FROM topics ORDER BY time DESC LIMIT ?;"
 #define SELECT_MESSAGE_COUNT             "SELECT Count(*) FROM messages;"
 

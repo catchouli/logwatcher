@@ -1,3 +1,7 @@
+// TODOs:
+// Cleanup at exit and sigint to help with debugging
+// Look into thread safety and performance benefits of enabling multiple threads in mhttpd
+
 #define _XOPEN_SOURCE 700
 
 #include <stdlib.h>
@@ -8,6 +12,7 @@
 #include <malloc.h>
 #include <stdarg.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/inotify.h>
 #include <sys/types.h>
 #include <sys/select.h>
@@ -21,10 +26,7 @@
 #include "queries.h"
 #include "stringstream.h"
 
-#define CONFIG_FILE "logwatcher.conf"
-
-// Parse lines of log
-void parse_lines(char* lines);
+#define CONFIG_FILE_DEFAULT "logwatcher.conf"
 
 // Parse line of log
 void parse_line(const char* line);
@@ -63,15 +65,18 @@ void timer_start();
 void timer_end();
 
 // Globals
-sqlite3* db;                  // Sqlite database
-char* sqlite_error = NULL;    // Sqlite error
+sqlite3* db;                    // Sqlite database
+char* sqlite_error = NULL;      // Sqlite error
 
-int sqlite_messages = 0;      // Messages in message table
+int sqlite_messages = 0;        // Messages in message table
 
-time_t current_day = 0;       // Current day (last encountered in log)
-time_t latest_time = 0;       // Latest time encountered
+time_t current_day = 0;         // Current day (last encountered in log)
+time_t latest_time_at_load = 0; // Latest time encountered
+int messages_skipped = 0;       // Messages skipped at this time
+int messages_to_skip = 0;       // Messages to skip at this time
 
 // Configuration variables
+const char* config_file = CONFIG_FILE_DEFAULT;
 const char* database_filename;
 const char* network;
 const char* channel;
@@ -93,6 +98,7 @@ int main(int argc, char** argv)
 	size_t data_read;                // Amount of data read by getline
 	char* line;                      // Pointer to getline buffer
 	size_t size;                     // Size of getline buffer
+	size_t old_position;             // Old position in buffer
 
 	struct MHD_Daemon* daemon;       // microhttpd daemon
 	int port = 0;                    // httpd port
@@ -100,11 +106,20 @@ int main(int argc, char** argv)
 	int rc;                          // Return code
 	sqlite3_stmt* statement;         // Sqlite statement
 
+	// Check args for config file
+	if (argc >= 2)
+	{
+		config_file = argv[1];
+	}
+
+	// Print config filename
+	printf("Using config file: %s\n", config_file);
+
 	// Initialise config struct
 	config_init(&config);
 
 	// Read config file
-	rc = config_read_file(&config, CONFIG_FILE);
+	rc = config_read_file(&config, config_file);
 	if (rc != CONFIG_TRUE)
 	{
 		fprintf(stderr, CONFIG_LOAD_FAILURE, config_error_text(&config), config_error_line(&config));
@@ -153,25 +168,36 @@ int main(int argc, char** argv)
 
 	// Get logfile length
 	logfile_fd = fopen(logfile, "r");
-	fseek(logfile_fd, 0, SEEK_END);
+	//fseek(logfile_fd, 0, SEEK_END);
 	logfile_len = ftell(logfile_fd);
 
 	// Read logfile
 	printf("Reading logfile...\n");
-	fseek(logfile_fd, 0, SEEK_SET);
+	//fseek(logfile_fd, 0, SEEK_SET);
 
 	// Initialise httpd
 	printf("Initialising httpd...\n");
 	daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, port, NULL, NULL,
-					&generate_statistics, NULL, MHD_OPTION_END);
+					&generate_statistics, NULL,
+					MHD_OPTION_THREAD_POOL_SIZE, (unsigned int)16,
+					MHD_OPTION_END);
 	if (daemon == NULL)
 	{
 		fprintf(stderr, MHD_INIT_FAILURE);
 		return MHD_INIT_FAILURE_ID;
 	}
 
-	// Create sqlite database
-	printf("Creating database...\n");
+	// Enable sqlite serialized threads mode
+	rc = sqlite3_config(SQLITE_CONFIG_SERIALIZED);
+	if (rc == SQLITE_ERROR)
+	{
+		fprintf(stderr, "Failed to set sqlite to serialized threads mode, is "
+				"sqlite compiled without thread support?");
+		return -1;
+	}
+
+	// Create or open sqlite database
+	printf("Opening database...\n");
 	rc = sqlite3_open(database_filename, &db);
 	if (rc)
 	{
@@ -205,7 +231,7 @@ int main(int argc, char** argv)
 	}
 
 	// Get latest message time from database
-	latest_time = 0;
+	latest_time_at_load = 0;
 
 	// Prepare statement
 	rc = sqlite3_prepare_v2(db, SELECT_LATEST_MESSAGES, -1, &statement, NULL);
@@ -222,19 +248,38 @@ int main(int argc, char** argv)
 	rc = sqlite3_step(statement);
 	if (rc == SQLITE_ROW)
 	{
-		latest_time = (time_t)sqlite3_column_int(statement, 0);
+		latest_time_at_load = (time_t)sqlite3_column_int(statement, 0);
 
-		printf("Got latest time from database: %d\n", (int)latest_time);
+		printf("Got latest time from database: %d\n", (int)latest_time_at_load);
 
+		rc = sqlite3_finalize(statement);
+
+		// Get number of messages to skip at this time
+		// (so we don't double up messages at the same time)
+		rc = sqlite3_prepare_v2(db, SELECT_MESSAGE_COUNT_AT_TIME, -1, &statement, NULL);
+		if (rc != SQLITE_OK)
+		{
+			fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
+			return SQLITE_STATEMENT_PREPERATION_FAILURE_ID;
+		}
+
+		// Bind parameters
+		sqlite3_bind_int(statement, 1, latest_time_at_load);
+
+		// Run statement
 		rc = sqlite3_step(statement);
+		if (rc == SQLITE_ROW)
+		{
+			messages_to_skip = sqlite3_column_int(statement, 0);
+
+			rc = sqlite3_finalize(statement);
+		}
 	}
 	else
 	{
-		printf("Creating new db");
+		printf("Creating new db\n");
+		sqlite3_finalize(statement);
 	}
-
-	// Clean up statement
-	sqlite3_finalize(statement);
 
         // Get total message count
 	sqlite_messages = 0;
@@ -346,16 +391,32 @@ int main(int argc, char** argv)
 	// Iterate through lines
 	printf("Parsing logfile...\n");
 
-	if (latest_time > 0)
+	if (latest_time_at_load > 0)
 	{
 		printf("Skipping to new messages...\n");
 	}
 
+	// Get starting position in buffer
+	old_position = ftell(logfile_fd);
+
+	// Read lines
 	line = NULL;
 	while ((data_read = getline(&line, &size, logfile_fd)) != -1)
 	{
 		if (line != NULL)
 		{
+			// If last character isn't a linebreak,
+			// Break and let monitoring loop get it instead
+			// (this is the last line of the file and is not yet complete)
+			if (line[data_read-1] != '\n')
+			{
+				fseek(logfile_fd, old_position, SEEK_SET);
+				break;
+			}
+
+			// Update position in buffer
+			old_position = ftell(logfile_fd);
+
 			// Parse line
 			parse_line(line);
 
@@ -371,54 +432,39 @@ int main(int argc, char** argv)
 	printf("Waiting for new messages...\n");
 	while (read(inotify_fd, &event, sizeof(struct inotify_event)))
 	{
-		char* new_text;
-		size_t new_text_len;
-		long new_logfile_len;
-
-		// Get new length
-		fseek(logfile_fd, 0, SEEK_END);
-		new_logfile_len = ftell(logfile_fd);
-		new_text_len = (size_t)(new_logfile_len - logfile_len);
-		new_text = malloc(new_text_len);
-
-		// Seek to new messages
-		fseek(logfile_fd, logfile_len, SEEK_SET);
+		// Get current position
+		old_position = ftell(logfile_fd);
 
 		// Read new text
-		fread(new_text, new_text_len, 1, logfile_fd);
+		//fread(new_text, new_text_len, 1, logfile_fd);
+	        line = NULL;
+	        while ((data_read = getline(&line, &size, logfile_fd)) != -1)
+	        {
+	                if (line != NULL)
+	                {
+				// If last character isn't a linebreak,
+				// Seek back and continue monitoring file
+				// (this is the end of the file and this line is not yet complete)
+				if (line[data_read-1] != '\n')
+				{
+					fseek(logfile_fd, old_position, SEEK_SET);
+					break;
+				}
 
-		// Handle new text
-		parse_lines(new_text);
+				// Update old position
+				old_position = ftell(logfile_fd);
 
-		// Update logfile length
-		logfile_len = new_logfile_len;
+	                        // Parse line
+	                        parse_line(line);
 
-		// Deallocate memory
-		free(new_text);
+	                        // Free memory allocated by getline
+	                        free(line);
+	                        line = NULL;
+	                }
+	        }
 	}
-
-	// Clean up
-	config_destroy(&config);
-	inotify_rm_watch(inotify_fd, inotify_wd);
-	fclose(logfile_fd);
 
 	return 0;
-}
-
-void parse_lines(char* lines)
-{
-	char* position;
-
-	// Iterate through lines
-	position = strtok(lines, "\n");
-	while (position != NULL)
-	{
-		// Parse line from log
-		parse_line(position);
-
-		// Next line
-		position = strtok(NULL, "\n");
-	}
 }
 
 void parse_line(const char* line)
@@ -470,7 +516,7 @@ void parse_line(const char* line)
 		// Convert day to unix time
 		current_day = mktime(&time_struct);
 
-		goto cleanup;
+		goto parse_line_cleanup;
 	}
 
 	// Parse topic
@@ -485,7 +531,7 @@ void parse_line(const char* line)
 		time = current_day + hour * 3600 + minute * 60;
 
 		// Skip if from the past
-		if (time > latest_time)
+		if (time > latest_time_at_load)
 		{
 			// Add topic to database
 			rc = sqlite3_prepare_v2(db, INSERT_TOPIC, -1, &statement, NULL);
@@ -493,7 +539,7 @@ void parse_line(const char* line)
 			{
 				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_TOPIC);
-				goto cleanup;
+				goto parse_line_cleanup;
 			}
 
 			// Bind values
@@ -513,7 +559,7 @@ void parse_line(const char* line)
 			sqlite3_finalize(statement);
 		}
 
-		goto cleanup;
+		goto parse_line_cleanup;
 	}
 
 	// Parse message string
@@ -529,15 +575,23 @@ void parse_line(const char* line)
 		// Calculate time
 		time = current_day + hour * 3600 + minute * 60;
 
-		if (time > latest_time)
+		if (time >= latest_time_at_load)
 		{
+			// Skip messages already in the db at load
+			if (time == latest_time_at_load && messages_skipped < messages_to_skip)
+			{
+				messages_skipped++;
+
+				goto parse_line_cleanup;
+			}
+
 			// Add message to database
 			rc = sqlite3_prepare_v2(db, INSERT_MESSAGE, -1, &statement, NULL);
 			if (rc != SQLITE_OK)
 			{
 				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 				fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE);
-				goto cleanup;
+				goto parse_line_cleanup;
 			}
 
 			// Bind values
@@ -562,7 +616,7 @@ void parse_line(const char* line)
 			{
 				fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 				fprintf(stderr, SQLITE_PROBLEM_QUERY, INCREMENT_MESSAGE_COUNT);
-				goto cleanup;
+				goto parse_line_cleanup;
 			}
 
 			// Bind values
@@ -589,7 +643,7 @@ void parse_line(const char* line)
 				{
 					fprintf(stderr, SQLITE_STATEMENT_PREPERATION_FAILURE, sqlite3_errmsg(db));
 					fprintf(stderr, SQLITE_PROBLEM_QUERY, INSERT_MESSAGE_COUNT);
-					goto cleanup;
+					goto parse_line_cleanup;
 				}
 
 				// Bind values
@@ -612,10 +666,10 @@ void parse_line(const char* line)
 			sqlite_messages++;
 		}
 
-		goto cleanup;
+		goto parse_line_cleanup;
 	}
 
-cleanup:
+parse_line_cleanup:
 	free(nick);
 	free(message);
 }
@@ -654,15 +708,15 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 	struct stats_user* users = NULL;        // Users array for stats_* calls
 	struct stats_message* messages = NULL;  // Messages array for stats* calls
 
+	// Allocate memory for arrays
+	users = malloc(sizeof(struct stats_user) * STATS_MAX(max_highscore_users, max_extended_hs));
+	messages = malloc(sizeof(struct stats_message) * STATS_MAX(random_message_count, latest_topic_count));
+
 	// Create stringstream
 	ss = ss_create();
 
 	// Initialise start time
 	clock_gettime(CLOCK_MONOTONIC, &start);
-
-	// Allocate memory for arrays
-	users = malloc(sizeof(struct stats_user) * STATS_MAX(max_highscore_users, max_extended_hs));
-	messages = malloc(sizeof(struct stats_message) * STATS_MAX(random_message_count, latest_topic_count));
 
 	// Get page mode
 	mode = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "mode");
@@ -673,9 +727,6 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 
 	if (strcmp(mode, "html") == 0)
 	{
-		// Begin transaction
-		execute_sql("BEGIN TRANSACTION;");
-
 		// Write start of page
 		ss_add(&ss, "<html><head><link rel=\"stylesheet\" href=\"http://www.renaporn.com/~rena/stats.css\">");
 
@@ -778,8 +829,6 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 		ss_add(&ss, "<br>");
 		ss_add(&ss, buffer);
 		ss_add(&ss, "</body></html>");
-
-		execute_sql("END TRANSACTION;");
 	}
 	else if (strcmp(mode, "json") == 0)
 	{
@@ -814,7 +863,8 @@ int generate_statistics(void* cls, struct MHD_Connection* connection,
 	rc = MHD_queue_response(connection, MHD_HTTP_OK, response);
 	MHD_destroy_response(response);
 
-	// Clean up arrays
+	// Clean up memory
+	ss_destroy(&ss);
 	free(users);
 	free(messages);
 
@@ -884,6 +934,12 @@ int stats_get_top_users_full(struct stats_user* users, int count)
 		message = (const char*)sqlite3_column_text(statement, 2);
 		lastseen = (time_t)sqlite3_column_int(statement, 3);
 
+		// If a blank string is in the db sqlite will return NULL
+		if (nick == NULL)
+			nick = "";
+		if (message == NULL)
+			message = "";
+
 		// Add to array
 		strncpy(users[i].nick, nick, STATS_NICK_LEN);
 		strncpy(users[i].message, message, STATS_MESSAGE_LEN);
@@ -900,6 +956,7 @@ int stats_get_top_users_full(struct stats_user* users, int count)
 	// Make sure query completed successfully
 	if (rc != SQLITE_DONE)
 	{
+		fprintf(stderr, "test\n");
 		fprintf(stderr, SQLITE_QUERY_FAILURE, sqlite3_errmsg(db));
 		fprintf(stderr, SQLITE_PROBLEM_QUERY, SELECT_TOP_USERS_TABLE);
 	}
@@ -945,6 +1002,12 @@ int stats_get_top_users_min(struct stats_user* users, int count, int offset)
 		messages = sqlite3_column_int(statement, 1);
 		message = (const char*)sqlite3_column_text(statement, 2);
 		lastseen = (time_t)sqlite3_column_int(statement, 3);
+
+		// If a blank string is in the db sqlite will return NULL
+		if (nick == NULL)
+			nick = "";
+		if (message == NULL)
+			message = "";
 
 		// Add to array
 		strncpy(users[i].nick, nick, STATS_NICK_LEN);
@@ -1002,6 +1065,12 @@ int stats_get_random_messages(struct stats_message* messages, int count)
 		nick = (const char*)sqlite3_column_text(statement, 0);
 		message = (const char*)sqlite3_column_text(statement, 1);
 
+		// If a blank string is in the db sqlite will return NULL
+		if (nick == NULL)
+			nick = "";
+		if (message == NULL)
+			message = "";
+
 		strncpy(messages[i].nick, nick, STATS_NICK_LEN);
 		strncpy(messages[i].message, message, STATS_MESSAGE_LEN);
 
@@ -1056,6 +1125,12 @@ int stats_get_last_topics(struct stats_message* topics, int count)
 		time = (time_t)sqlite3_column_int(statement, 0);
 		nick = (const char*)sqlite3_column_text(statement, 1);
 		message = (const char*)sqlite3_column_text(statement, 2);
+
+		// If a blank string is in the db sqlite will return NULL
+		if (nick == NULL)
+			nick = "";
+		if (message == NULL)
+			message = "";
 
 		topics[i].time = time;
 		strncpy(topics[i].nick, nick, STATS_NICK_LEN);
