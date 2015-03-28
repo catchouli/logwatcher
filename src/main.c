@@ -570,7 +570,7 @@ void parse_line(const char* line)
 		sqlite3_stmt* statement;
 
 		// Remove first character from nick (op char)
-		strcpy(nick, nick+1);
+		char* nick_only = nick+1;
 
 		// Calculate time
 		time = current_day + hour * 3600 + minute * 60;
@@ -595,7 +595,7 @@ void parse_line(const char* line)
 			}
 
 			// Bind values
-			sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
+			sqlite3_bind_text(statement, 1, nick_only, -1, SQLITE_STATIC);
 			sqlite3_bind_text(statement, 2, message, -1, SQLITE_STATIC);
 			sqlite3_bind_int(statement, 3, time);
 
@@ -621,7 +621,7 @@ void parse_line(const char* line)
 
 			// Bind values
 			sqlite3_bind_int(statement, 1, time);
-			sqlite3_bind_text(statement, 2, nick, -1, SQLITE_STATIC);
+			sqlite3_bind_text(statement, 2, nick_only, -1, SQLITE_STATIC);
 
 			// Run statement
 			rc = sqlite3_step(statement);
@@ -647,7 +647,7 @@ void parse_line(const char* line)
 				}
 
 				// Bind values
-				sqlite3_bind_text(statement, 1, nick, -1, SQLITE_STATIC);
+				sqlite3_bind_text(statement, 1, nick_only, -1, SQLITE_STATIC);
 				sqlite3_bind_int(statement, 2, time);
 
 				// Run statement
